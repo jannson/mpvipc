@@ -2,11 +2,14 @@
 
 package mpvipc
 
-import ( 
-	"gopkg.in/natefinch/npipe.v2"
+import (
 	"net"
+	"time"
+
+	winio "github.com/Microsoft/go-winio"
 )
 
 func dial(path string) (net.Conn, error) {
-	return npipe.Dial(path)
+	timeout := time.Second * 10
+	return winio.DialPipe(path, &timeout)
 }
