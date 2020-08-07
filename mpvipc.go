@@ -5,9 +5,15 @@ package mpvipc
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
+	"time"
+)
+
+var (
+	ErrClientClosed = errors.New("client connection closed")
 )
 
 // Connection represents a connection to a mpv IPC socket
@@ -110,7 +116,7 @@ func (c *Connection) ListenForEvents(events chan<- *Event, stop <-chan struct{})
 // NewEventListener, read events from the events channel and send an empty
 // struct to the stop channel to close it.
 func (c *Connection) NewEventListener() (chan *Event, chan struct{}) {
-	events := make(chan *Event)
+	events := make(chan *Event, 16)
 	stop := make(chan struct{})
 	go c.ListenForEvents(events, stop)
 	return events, stop
@@ -123,13 +129,12 @@ func (c *Connection) Call(arguments ...interface{}) (interface{}, error) {
 	c.lock.Lock()
 	c.lastRequest++
 	id := c.lastRequest
-	resultChannel := make(chan *commandResult)
+	resultChannel := make(chan *commandResult, 1)
 	c.waitingRequests[id] = resultChannel
 	c.lock.Unlock()
 
 	defer func() {
 		c.lock.Lock()
-		close(c.waitingRequests[id])
 		delete(c.waitingRequests, id)
 		c.lock.Unlock()
 	}()
@@ -139,11 +144,20 @@ func (c *Connection) Call(arguments ...interface{}) (interface{}, error) {
 		return nil, err
 	}
 
-	result := <-resultChannel
-	if result.Status == "success" {
-		return result.Data, nil
+	var deadline <-chan time.Time
+	timer := time.NewTimer(time.Second * 5)
+	defer timer.Stop()
+	deadline = timer.C
+
+	select {
+	case result := <-resultChannel:
+		if result.Status == "success" {
+			return result.Data, nil
+		}
+		return nil, fmt.Errorf("mpv error: %s", result.Status)
+	case <-deadline:
+		return nil, errors.New("timeout")
 	}
-	return nil, fmt.Errorf("mpv error: %s", result.Status)
 }
 
 // Set is a shortcut to Call("set_property", property, value)
@@ -187,6 +201,8 @@ func (c *Connection) Close() error {
 // It's ok to use IsClosed() to check if you need to reopen the connection
 // before calling a command.
 func (c *Connection) IsClosed() bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
 	return c.client == nil
 }
 
@@ -194,7 +210,7 @@ func (c *Connection) IsClosed() bool {
 // for an explanation of the closed state.
 func (c *Connection) WaitUntilClosed() {
 	c.lock.Lock()
-	if c.IsClosed() {
+	if c.client == nil {
 		c.lock.Unlock()
 		return
 	}
@@ -214,9 +230,14 @@ func (c *Connection) WaitUntilClosed() {
 }
 
 func (c *Connection) sendCommand(id uint, arguments ...interface{}) error {
-	if c.client == nil {
-		return fmt.Errorf("trying to send command on closed mpv client")
+	var client net.Conn
+	c.lock.Lock()
+	client = c.client
+	c.lock.Unlock()
+	if client == nil {
+		return ErrClientClosed
 	}
+
 	message := &commandRequest{
 		Arguments: arguments,
 		ID:        id,
@@ -257,6 +278,7 @@ func (c *Connection) checkResult(data []byte) {
 		return // not a result
 	}
 	c.lock.Lock()
+	// not ok means the request is deleted
 	request, ok := c.waitingRequests[result.ID]
 	c.lock.Unlock()
 	if ok {
@@ -273,14 +295,21 @@ func (c *Connection) checkEvent(data []byte) {
 	if event.Name == "" {
 		return // not an event
 	}
+	eventsCh := make([]chan<- *Event, 0, 8)
 	c.lock.Lock()
 	for listenerID := range c.eventListeners {
 		listener := c.eventListeners[listenerID]
-		go func() {
-			listener <- event
-		}()
+		eventsCh = append(eventsCh, listener)
 	}
 	c.lock.Unlock()
+
+	for _, eventCh := range eventsCh {
+		select {
+		case eventCh <- event:
+		default:
+			// ignore the recent
+		}
+	}
 }
 
 func (c *Connection) listen() {
